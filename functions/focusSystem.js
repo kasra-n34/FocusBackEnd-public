@@ -1,5 +1,5 @@
 const { logger } = require("firebase-functions");
-const { FieldValue } = require("firebase-admin/firestore");
+const { FieldValue, getFirestore} = require("firebase-admin/firestore");
 
 /* Main function to check task completion and award points based on collection/pillar-------------------------*/
 
@@ -43,363 +43,300 @@ async function checkTaskCompletion(event, db) {
 /*Functions to handle task completion for each pillar---------------------------------------------------------*/
 
 // Handles physicality objectives, awarding points based on task completion
+
+
+// Handles physicality objectives
+
+const db = getFirestore(); // Use the initialized Firestore instance
+
+// Handles physicality objectives
 async function handlePhysicalityObjectives(taskData, userRef, event) {
   const { progress, goal, isAchieved, title, calorieStrategy } = taskData;
-  const userDoc = await userRef.get();
-  const userData = userDoc.data();
-  const { accountCreationTime } = userData;
-  const dayOfWeek = accountCreationTime.toDate().getDay();
   const date = new Date();
-  const daysSinceCreation = Math.floor(
-    (date - accountCreationTime.toDate()) / (1000 * 60 * 60 * 24)
-  );
   let points = 0;
   let margin = 300;
   let calorieMinimum = 1500;
   let modifiedGoal = goal;
 
-  // Adjust goal if the user is in their first week
-  if (daysSinceCreation < 7) {
-    switch (dayOfWeek) {
-      case 3: // Wednesday
-      case 4: // Thursday
-        modifiedGoal = Math.floor(goal * 0.4);
-        break;
-      case 5: // Friday
-      case 6: // Saturday
-        modifiedGoal = Math.floor(goal * 0.2);
-        break;
-      case 0: // Sunday
-        modifiedGoal = Math.floor(goal * 0.1);
-        break;
-      default:
-        // No changes for Monday (1) and Tuesday (2)
-        break;
-    }
-  }
-
   try {
-    if (title === "Track Calories") {
-      switch (calorieStrategy) {
-        case "Maintain":
-          if (
-            progress <= modifiedGoal + margin &&
-            progress >= modifiedGoal - margin &&
-            !isAchieved
-          ) {
-            points = 3; // Award points for achieving the goal
-          }
-          break;
-
-        case "Bulk":
-          if (progress >= modifiedGoal && !isAchieved) {
-            points = 3; // Award points for achieving the goal
-          }
-          break;
-
-        case "Cut":
-          if (
-            progress <= modifiedGoal &&
-            progress >= calorieMinimum &&
-            !isAchieved
-          ) {
-            points = 3; // Award points for achieving the goal
-          }
-          break;
-
-        default:
-          logger.error(`Unknown calorie strategy: ${calorieStrategy}`);
-          break;
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) {
+        logger.error(`User ${userRef.id} does not exist.`);
+        return;
       }
-    } else {
-      if (progress >= modifiedGoal && !isAchieved) {
-        points = 3; // Award points for achieving the general goal
+
+      const updatedTaskDoc = await transaction.get(event.data.after.ref);
+      if (updatedTaskDoc.data().isAchieved) {
+        logger.info(`Task already marked as achieved for user ${userRef.id}, skipping.`);
+        return;
       }
-    }
 
-    if (points > 0) {
-      // Increment the points in the database
-      await userRef.update({
-        physicalityPoints: FieldValue.increment(points),
-      });
-      logger.info(
-        `User ${userRef.id} awarded ${points} points for physicality objective.`
-      );
+      // Adjust goal in the first week based on account creation day
+      const userData = userDoc.data();
+      const accountCreationTime = userData.accountCreationTime.toDate();
+      const daysSinceCreation = Math.floor((date - accountCreationTime) / (1000 * 60 * 60 * 24));
+      if (daysSinceCreation < 7) {
+        const dayOfWeek = accountCreationTime.getDay();
+        switch (dayOfWeek) {
+          case 3: case 4: modifiedGoal = Math.floor(goal * 0.4); break;
+          case 5: case 6: modifiedGoal = Math.floor(goal * 0.2); break;
+          case 0: modifiedGoal = Math.floor(goal * 0.1); break;
+        }
+      }
 
-      // Re-fetch the updated user document after the points update
-      const updatedUserDoc = await userRef.get();
-      const updatedUserData = updatedUserDoc.data();
+      // Award points based on strategy
+      if (title === "Track Calories") {
+        switch (calorieStrategy) {
+          case "Maintain":
+            if (progress <= modifiedGoal + margin && progress >= modifiedGoal - margin) points = 3;
+            break;
+          case "Bulk":
+            if (progress >= modifiedGoal) points = 3;
+            break;
+          case "Cut":
+            if (progress <= modifiedGoal && progress >= calorieMinimum) points = 3;
+            break;
+          default:
+            logger.error(`Unknown calorie strategy: ${calorieStrategy}`);
+        }
+      } else {
+        if (progress >= modifiedGoal) points = 3;
+      }
 
-      // Update isAchieved status in the task document
-      await event.data.after.ref.update({ isAchieved: true });
-      logger.info(`Task marked as achieved for user ${userRef.id}.`);
+      if (points > 0) {
+        transaction.update(userRef, {
+          physicalityPoints: FieldValue.increment(points),
+        });
+        transaction.update(event.data.after.ref, { isAchieved: true });
+        logger.info(`User ${userRef.id} awarded ${points} points for physicality objective.`);
+      }
+    });
 
-      // Use the updated user data to calculate the new ratings
-      await updatePillarRating(userRef, updatedUserData, "physicality");
-      await updateFocusRating(userRef, updatedUserData);
-    }
+    // Fetch updated data and update ratings
+    const updatedUserDoc = await userRef.get();
+    await updatePillarRating(userRef, updatedUserDoc.data(), "physicality");
+    await updateFocusRating(userRef, updatedUserDoc.data());
+
   } catch (error) {
-    logger.error(
-      `Error updating physicality points or isAchieved for user ${userRef.id}:`,
-      error
-    );
+    logger.error(`Error updating physicality points for user ${userRef.id}:`, error);
   }
 }
 
-// Handles mindfulness objectives, awarding points based on task completion
+// Handles mindfulness objectives
 async function handleMindfulnessObjectives(taskData, userRef, event) {
   const { progress, goal, isAchieved } = taskData;
-  const userDoc = await userRef.get();
-  const userData = userDoc.data();
-  const { accountCreationTime } = userData;
-  const dayOfWeek = accountCreationTime.toDate().getDay();
   const date = new Date();
-  const daysSinceCreation = Math.floor(
-    (date - accountCreationTime.toDate()) / (1000 * 60 * 60 * 24)
-  );
   let points = 0;
   let modifiedGoal = goal;
 
-  // Adjust goal if the user is in their first week
-  if (daysSinceCreation < 7) {
-    switch (dayOfWeek) {
-      case 3: // Wednesday
-      case 4: // Thursday
-        modifiedGoal = Math.floor(goal * 0.4);
-        break;
-      case 5: // Friday
-      case 6: // Saturday
-        modifiedGoal = Math.floor(goal * 0.2);
-        break;
-      case 0: // Sunday
-        modifiedGoal = Math.floor(goal * 0.1);
-        break;
-      default:
-        // No changes for Monday (1) and Tuesday (2)
-        break;
-    }
-  }
+  try {
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) {
+        logger.error(`User ${userRef.id} does not exist.`);
+        return;
+      }
 
-  if (progress >= modifiedGoal && !isAchieved) {
-    points = 3;
+      const updatedTaskDoc = await transaction.get(event.data.after.ref);
+      if (updatedTaskDoc.data().isAchieved) {
+        logger.info(`Task already marked as achieved for user ${userRef.id}, skipping.`);
+        return;
+      }
 
-    try {
-      // Increment the points in the database
-      await userRef.update({
-        mindfulnessPoints: FieldValue.increment(points),
-      });
-      logger.info(
-        `User ${userRef.id} awarded ${points} points for mindfulness objective.`
-      );
+      // Adjust goal in the first week based on account creation day
+      const userData = userDoc.data();
+      const accountCreationTime = userData.accountCreationTime.toDate();
+      const daysSinceCreation = Math.floor((date - accountCreationTime) / (1000 * 60 * 60 * 24));
+      if (daysSinceCreation < 7) {
+        const dayOfWeek = accountCreationTime.getDay();
+        switch (dayOfWeek) {
+          case 3: case 4: modifiedGoal = Math.floor(goal * 0.4); break;
+          case 5: case 6: modifiedGoal = Math.floor(goal * 0.2); break;
+          case 0: modifiedGoal = Math.floor(goal * 0.1); break;
+        }
+      }
 
-      // Re-fetch the updated user document after the points update
-      const updatedUserDoc = await userRef.get();
-      const updatedUserData = updatedUserDoc.data();
+      if (progress >= modifiedGoal) {
+        points = 3;
+        transaction.update(userRef, {
+          mindfulnessPoints: FieldValue.increment(points),
+        });
+        transaction.update(event.data.after.ref, { isAchieved: true });
+        logger.info(`User ${userRef.id} awarded ${points} points for mindfulness objective.`);
+      }
+    });
 
-      // Update isAchieved status in the task document
-      await event.data.after.ref.update({ isAchieved: true });
-      logger.info(`Task marked as achieved for user ${userRef.id}.`);
+    // Fetch updated data and update ratings
+    const updatedUserDoc = await userRef.get();
+    await updatePillarRating(userRef, updatedUserDoc.data(), "mindfulness");
+    await updateFocusRating(userRef, updatedUserDoc.data());
 
-      // Use the updated user data to calculate the new ratings
-      await updatePillarRating(userRef, updatedUserData, "mindfulness");
-      await updateFocusRating(userRef, updatedUserData);
-    } catch (error) {
-      logger.error(
-        `Error updating mindfulness points or isAchieved for user ${userRef.id}:`,
-        error
-      );
-    }
+  } catch (error) {
+    logger.error(`Error updating mindfulness points for user ${userRef.id}:`, error);
   }
 }
 
-// Handles profession objectives, awarding points based on task completion and deadline
-async function handleProfessionObjectives(taskData, userRef, event, db) {
+// Handles profession objectives
+async function handleProfessionObjectives(taskData, userRef, event) {
   const { checkOffTime, time, creationTime } = taskData;
   const taskID = event.params.taskID;
   const now = new Date();
-  const cap = 15; // Maximum points that can be awarded daily
+  const cap = 15;
   let pointsToAward = 0;
 
   try {
-    // Fetch the user document to get current points
-    const userDoc = await userRef.get();
-    if (!userDoc.exists) {
-      logger.error(`User ${userRef.id} does not exist.`);
-    }
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) {
+        logger.error(`User ${userRef.id} does not exist.`);
+        return;
+      }
 
-    const userData = userDoc.data();
-    let dailyProfessionPoints = userData.dailyProfessionPoints || 0;
-    let professionPoints = userData.professionPoints || 0;
+      const userData = userDoc.data();
+      let dailyProfessionPoints = userData.dailyProfessionPoints || 0;
+      let professionPoints = userData.professionPoints || 0;
 
-    if (time && checkOffTime) {
-      if (now > time.toDate()) {
-        // Task passed the deadline, apply decay
-        const decayPoints = await calculateDecayPoints(userRef, "profession"); // Should be negative
-
-        // Apply decay to professionPoints and dailyProfessionPoints
-        professionPoints = Math.max(professionPoints + decayPoints, 0);
-        dailyProfessionPoints = Math.max(
-          dailyProfessionPoints + decayPoints,
-          0
-        );
-
-        // Update professionPoints and dailyProfessionPoints directly
-        await userRef.update({
-          professionPoints: professionPoints,
-          dailyProfessionPoints: dailyProfessionPoints,
-        });
-
-        logger.info(
-          `Task ${taskID} for user ${userRef.id} passed deadline, applying decay. New professionPoints: ${professionPoints}, New dailyProfessionPoints: ${dailyProfessionPoints}`
-        );
-
-        await deleteProfessionTask(taskID, db);
-      } else if (checkOffTime.toDate() > creationTime.toDate()) {
-        // Task completed before deadline, assign full points with daily cap
+      if (time && checkOffTime) {
+        if (now > time.toDate()) {
+          const decayPoints = await calculateDecayPoints(userRef, "profession");
+          transaction.update(userRef, {
+            professionPoints: Math.max(professionPoints + decayPoints, 0),
+            dailyProfessionPoints: Math.max(dailyProfessionPoints + decayPoints, 0),
+          });
+          logger.info(`Task ${taskID} for user ${userRef.id} passed deadline, applying decay.`);
+          await deleteProfessionTask(taskID, db);
+        } else if (checkOffTime.toDate() > creationTime.toDate()) {
+          const remainingCap = cap - dailyProfessionPoints;
+          if (remainingCap > 0) {
+            pointsToAward = Math.min(4, remainingCap);
+            transaction.update(userRef, {
+              professionPoints: FieldValue.increment(pointsToAward),
+              dailyProfessionPoints: FieldValue.increment(pointsToAward),
+            });
+            logger.info(`Task ${taskID} for user ${userRef.id} completed before deadline, awarded ${pointsToAward} points.`);
+          }
+          await deleteProfessionTask(taskID, db);
+        }
+      } else if (!time && checkOffTime) {
         const remainingCap = cap - dailyProfessionPoints;
         if (remainingCap > 0) {
-          pointsToAward = Math.min(4, remainingCap);
-
-          // Update points
-          await userRef.update({
+          pointsToAward = Math.min(2, remainingCap);
+          transaction.update(userRef, {
             professionPoints: FieldValue.increment(pointsToAward),
             dailyProfessionPoints: FieldValue.increment(pointsToAward),
           });
-
-          logger.info(
-            `Task ${taskID} for user ${userRef.id} completed before deadline. Awarded ${pointsToAward} points.`
-          );
-        } else {
-          logger.info(
-            `Task ${taskID} for user ${userRef.id} completed before deadline. Daily cap reached. No points awarded.`
-          );
+          logger.info(`Task ${taskID} for user ${userRef.id} has no deadline, awarded ${pointsToAward} points.`);
         }
-
         await deleteProfessionTask(taskID, db);
       }
-    } else if (!time && checkOffTime) {
-      // No deadline, assign partial points with daily cap
-      const remainingCap = cap - dailyProfessionPoints;
-      if (remainingCap > 0) {
-        pointsToAward = Math.min(2, remainingCap);
+    });
 
-        // Update points
-        await userRef.update({
-          professionPoints: FieldValue.increment(pointsToAward),
-          dailyProfessionPoints: FieldValue.increment(pointsToAward),
-        });
-
-        logger.info(
-          `Task ${taskID} for user ${userRef.id} has no deadline, awarding ${pointsToAward} points.`
-        );
-      } else {
-        logger.info(
-          `Task ${taskID} for user ${userRef.id} has no deadline, but daily cap reached. No points awarded.`
-        );
-      }
-
-      await deleteProfessionTask(taskID, db);
-    }
-
-    // Re-fetch the updated user document after the points update
     const updatedUserDoc = await userRef.get();
-    const updatedUserData = updatedUserDoc.data();
+    await updatePillarRating(userRef, updatedUserDoc.data(), "profession");
+    await updateFocusRating(userRef, updatedUserDoc.data());
 
-    // Use the updated user data to calculate the new ratings
-    await updatePillarRating(userRef, updatedUserData, "profession");
-    await updateFocusRating(userRef, updatedUserData);
   } catch (error) {
-    logger.error(
-      `Error updating profession points or handling task ${taskID} for user ${userRef.id}:`,
-      error
-    );
+    logger.error(`Error updating profession points for user ${userRef.id}:`, error);
   }
 }
+
 
 /*------------------------------------------------------------------------------------------------------------*/
 
 /*Function for updating fields--------------------------------------------------------------------------------*/
 
 // Update the user's pillar ratings based on the total points they have earned
+
+
 async function updatePillarRating(userRef, userData, pillar) {
-  const { physicalityPoints, mindfulnessPoints, professionPoints } = userData;
-
-  let currentPoints;
-  let currentRating;
-  let updateData = {};
-
-  // Determine the pillar's points and rating
-  switch (pillar) {
-    case "physicality":
-      currentPoints = physicalityPoints;
-      currentRating = userData.physicalityRating;
-      break;
-    case "mindfulness":
-      currentPoints = mindfulnessPoints;
-      currentRating = userData.mindfulnessRating;
-      break;
-    case "profession":
-      currentPoints = professionPoints;
-      currentRating = userData.professionRating;
-      break;
-    default:
-      logger.error(`Invalid pillar: ${pillar}`);
-      return;
-  }
-
   try {
-    // Calculate the current rating and overflow points
-    let newRating = currentRating;
-    let pointsToLevelUp = await calculatePointsToLevelUp(newRating);
-
-    // Handle level-ups
-    while (currentPoints >= pointsToLevelUp) {
-      currentPoints -= pointsToLevelUp;
-      newRating++;
-      pointsToLevelUp = await calculatePointsToLevelUp(newRating);
-      if (newRating >= 99) {
-        currentPoints = 0; // Cap points at the maximum level
-        break;
+    await db.runTransaction(async (transaction) => {
+      const userDoc = await transaction.get(userRef);
+      if (!userDoc.exists) {
+        logger.error(`User ${userRef.id} does not exist.`);
+        return;
       }
-    }
 
-    // Handle level-downs (if necessary)
-    while (newRating > 50) {
-      const previousPointsToLevelUp = await calculatePointsToLevelUp(newRating - 1);
-      if (currentPoints < previousPointsToLevelUp) {
-        newRating--;
+      const userData = userDoc.data(); // Get latest Firestore data
+      let updateData = {};
+
+      // Determine which pillar to update
+      switch (pillar) {
+        case "physicality":
+          const newPhysicalityRating = await calculateCurrentRating(
+            userData.physicalityPoints, // Use latest Firestore value
+            userData.physicalityRating
+          );
+
+          if (newPhysicalityRating > userData.physicalityRating) {
+            let level = userData.physicalityRating;
+            let previousPointsToLevelUp = await calculatePointsToLevelUp(level);
+            updateData.physicalityPoints = userData.physicalityPoints - previousPointsToLevelUp;
+          }
+
+          // Prevent unnecessary updates
+          if (newPhysicalityRating !== userData.physicalityRating) {
+            updateData.physicalityRating = newPhysicalityRating;
+            updateData.physicalityPointsToLevelUp = await calculatePointsToLevelUp(newPhysicalityRating);
+          } else {
+            logger.info(`Skipping update: No change in physicality rating for user ${userRef.id}.`);
+          }
+          break;
+
+        case "mindfulness":
+          const newMindfulnessRating = await calculateCurrentRating(
+            userData.mindfulnessPoints,
+            userData.mindfulnessRating
+          );
+
+          if (newMindfulnessRating > userData.mindfulnessRating) {
+            let level = userData.mindfulnessRating;
+            let previousPointsToLevelUp = await calculatePointsToLevelUp(level);
+            updateData.mindfulnessPoints = userData.mindfulnessPoints - previousPointsToLevelUp;
+          }
+
+          if (newMindfulnessRating !== userData.mindfulnessRating) {
+            updateData.mindfulnessRating = newMindfulnessRating;
+            updateData.mindfulnessPointsToLevelUp = await calculatePointsToLevelUp(newMindfulnessRating);
+          } else {
+            logger.info(`Skipping update: No change in mindfulness rating for user ${userRef.id}.`);
+          }
+          break;
+
+        case "profession":
+          const newProfessionRating = await calculateCurrentRating(
+            userData.professionPoints,
+            userData.professionRating
+          );
+
+          if (newProfessionRating > userData.professionRating) {
+            let level = userData.professionRating;
+            let previousPointsToLevelUp = await calculatePointsToLevelUp(level);
+            updateData.professionPoints = userData.professionPoints - previousPointsToLevelUp;
+          }
+
+          if (newProfessionRating !== userData.professionRating) {
+            updateData.professionRating = newProfessionRating;
+            updateData.professionPointsToLevelUp = await calculatePointsToLevelUp(newProfessionRating);
+          } else {
+            logger.info(`Skipping update: No change in profession rating for user ${userRef.id}.`);
+          }
+          break;
+
+        default:
+          logger.error(`Invalid pillar: ${pillar}`);
+          return;
+      }
+
+      // Prevent unnecessary Firestore updates
+      if (Object.keys(updateData).length > 0) {
+        transaction.update(userRef, updateData);
+        logger.info(`Pillar ratings updated for user ${userRef.id}:`, updateData);
       } else {
-        break;
+        logger.info(`No changes needed for user ${userRef.id} on pillar ${pillar}.`);
       }
-    }
-
-    // Update the user's ratings and points
-    switch (pillar) {
-      case "physicality":
-        updateData = {
-          physicalityRating: newRating,
-          physicalityPoints: currentPoints,
-          physicalityPointsToLevelUp: pointsToLevelUp,
-        };
-        break;
-      case "mindfulness":
-        updateData = {
-          mindfulnessRating: newRating,
-          mindfulnessPoints: currentPoints,
-          mindfulnessPointsToLevelUp: pointsToLevelUp,
-        };
-        break;
-      case "profession":
-        updateData = {
-          professionRating: newRating,
-          professionPoints: currentPoints,
-          professionPointsToLevelUp: pointsToLevelUp,
-        };
-        break;
-    }
-
-    await userRef.update(updateData);
-    logger.info(`Pillar ratings and points updated for user ${userRef.id}:`, updateData);
+    });
   } catch (error) {
     logger.error(`Error updating pillar ratings for user ${userRef.id}:`, error);
   }
@@ -493,7 +430,7 @@ async function calculateCurrentRating(totalPoints, pillarRating) {
   let level = pillarRating;
 
   // Loop for incrementing the level if totalPoints are sufficient for the next level
-  while (true) {
+  
     let pointsRequired = await calculatePointsToLevelUp(level);
     logger.info(`Points required for level ${level}: ${pointsRequired}`);
     logger.info(`Total points: ${totalPoints}`);
@@ -503,25 +440,19 @@ async function calculateCurrentRating(totalPoints, pillarRating) {
       level++;
       if (level > 99) {
         level = 99;
-        break;
       }
-    } else {
-      // If not enough points for the next level, break the loop
-      break;
-    }
-  }
+    } 
 
   // Loop for decrementing the level if totalPoints are not enough for the current level
-  while (level > 50) {
+  if (level > 50) {
     let previousPointsToLevelUp = await calculatePointsToLevelUp(level - 1);
 
     // If totalPoints are not enough for the current level, decrement the level
-    if (totalPoints < previousPointsToLevelUp) {
+    if (totalPoints < 0) {
       level--;
-    } else {
-      // If enough points for the current level, break the loop
-      break;
-    }
+      totalPoints = previousPointsToLevelUp - totalPoints;
+    } 
+    
   }
 
   return level;
@@ -544,21 +475,21 @@ async function applyDailyDecayPoints(db) {
         const taskData = doc.data();
         const userRef = db.collection("users").doc(taskData.userID);
 
-        const points = await calculateDecayPoints(
+        const decayPoints = await calculateDecayPoints(
           userRef,
           collection === "physicality_objectives"
             ? "physicality"
             : "mindfulness"
         );
 
-        // Apply points but ensure they don't go below 0
+        // Apply decay points (rating will be lowered if its below zero by updatepillarrating)
         const updatedUserDoc = await userRef.get();
         const updatedUserData = updatedUserDoc.data();
         const currentPoints =
           collection === "physicality_objectives"
             ? updatedUserData.physicalityPoints
             : updatedUserData.mindfulnessPoints;
-        const newPoints = Math.max(currentPoints + points, 0);
+        const newPoints = currentPoints + decayPoints;
 
         await userRef.update({
           [collection === "physicality_objectives"
@@ -588,21 +519,21 @@ async function applyWeeklyDecayPoints(db) {
         const taskData = doc.data();
         const userRef = db.collection("users").doc(taskData.userID);
 
-        const points = await calculateDecayPoints(
+        const decayPoints = await calculateDecayPoints(
           userRef,
           collection === "physicality_objectives"
             ? "physicality"
             : "mindfulness"
         );
 
-        // Apply points but ensure they don't go below 0
+        // Apply decay points (rating will be lowered if its below zero by updatepillarrating)
         const updatedUserDoc = await userRef.get();
         const updatedUserData = updatedUserDoc.data();
         const currentPoints =
           collection === "physicality_objectives"
             ? updatedUserData.physicalityPoints
             : updatedUserData.mindfulnessPoints;
-        const newPoints = Math.max(currentPoints + points, 0);
+        const newPoints = currentPoints + decayPoints;
 
         await userRef.update({
           [collection === "physicality_objectives"
